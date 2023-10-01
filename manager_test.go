@@ -19,37 +19,6 @@ func TestManagerBuilder(t *testing.T) {
 	assert.Equal(t, 2048, mgr.wsWriteBufferSize)
 }
 
-// TestClientRegistration tests the client registration process
-func TestClientRegistration(t *testing.T) {
-	// Create a new instance of Manager
-	manager := NewDefaultManager()
-
-	var client *Client // to store the client returned by the channel
-
-	// Create a test HTTP server and request
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		clientCh := manager.UpgradeClientCh(w, r)
-		client = <-clientCh
-		if client == nil {
-			t.Fatalf("Client was nil!")
-		}
-	}))
-	defer server.Close()
-
-	// Create a WebSocket dialer to connect to the server
-	dialer := websocket.Dialer{}
-	conn, _, err := dialer.Dial("ws"+server.URL[4:], nil)
-	if err != nil {
-		t.Fatalf("Failed to open WebSocket connection: %v", err)
-	}
-	defer conn.Close()
-
-	assert.NotNil(t, client)
-	assert.NotNil(t, client.Conn)
-	assert.NotNil(t, client.ConnId)
-	assert.True(t, client.IsAlive)
-}
-
 func TestClientRegistrationWithHelper(t *testing.T) {
 	mgr := NewDefaultManager()
 	client, _, _ := helperGetWsClientComms(t, mgr)
