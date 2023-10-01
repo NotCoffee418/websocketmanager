@@ -84,6 +84,11 @@ To send messages, you have the following options:
   wsManager.SendMessageToUser(clientUUID, messageType, message)
   ```
 
+Message type definitions can be found in the [gorilla/websocket](https://github.com/gorilla/websocket/blob/666c197fc9157896b57515c3a3326c3f8c8319fe/conn.go#L63) library.
+```go
+messageType := websocket.TextMessage
+```
+
 ### Manage Clients
 
 You can manually unregister clients or retrieve specific clients by their UUID:
