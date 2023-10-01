@@ -43,9 +43,12 @@ wsManager := websocketmanager.NewBuilder().
 Upgrade an incoming HTTP request to a WebSocket connection:
 
 ```go
-clientCh := wsManager.UpgradeClientCh(w, r)
-client := <-clientCh
+func ginHandler(c *gin.Context) {
+	wsClient <- wsManager.UpgradeClientCh(c.Writer, c.Request)
+	//...
+}
 ```
+This library is agnostic to the specific Go web framework used, as long as the framework is based on Go's standard `net/http` package.
 
 ### Assign Groups
 
