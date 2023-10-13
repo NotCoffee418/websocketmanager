@@ -44,7 +44,7 @@ Upgrade an incoming HTTP request to a WebSocket connection:
 
 ```go
 func ginHandler(c *gin.Context) {
-	wsClient <- wsManager.UpgradeClientCh(c.Writer, c.Request)
+	wsClient <- wsManager.UpgradeClient(c.Writer, c.Request)
 	//...
 }
 ```

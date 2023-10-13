@@ -1,43 +1,81 @@
 package websocketmanager
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"sync"
+
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	log "github.com/sirupsen/logrus"
-	"net/http"
-	"time"
 )
 
-// initialize initializes the websocket manager
-// This function is called by the builder
-func (wm *Manager) initialize() {
-	if wm.allowCleanup {
-		go wm.pruneInactiveClients()
+// UpgradeClient upgrades a client connection to a websocket connection
+// It registers the client and returns a channel that will receive the Client or nil on error
+func (wm *Manager) UpgradeClient(w http.ResponseWriter, r *http.Request) (*Client, error) {
+
+	// Upgrade connection and pass it to parent thread
+	var upgrader = websocket.Upgrader{
+		ReadBufferSize:  wm.wsReadBufferSize,
+		WriteBufferSize: wm.wsWriteBufferSize,
 	}
+	wsConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = fmt.Fprintf(w, "Error creating websocket connection")
+		return nil, errors.New("error upgrading websocket connection")
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	client := wm.register(wsConn, cancel)
+	wm.initCommunication(client, ctx)
+	return client, nil
+
 }
 
-// UpgradeClientCh upgrades a client connection to a websocket connection
-// It registers the client and returns a channel that will receive the Client or nil on error
-func (wm *Manager) UpgradeClientCh(w http.ResponseWriter, r *http.Request) chan *Client {
-	upgradeChan := make(chan *Client, 1)
+// initCommunication sets up a goroutine to pass on communication safely
+// in both directions, and unregister the client when the connection closes.
+func (wm *Manager) initCommunication(client *Client, ctx context.Context) {
+	// Send out server messages
 	go func() {
-		defer close(upgradeChan)
-		var upgrader = websocket.Upgrader{
-			ReadBufferSize:  wm.wsReadBufferSize,
-			WriteBufferSize: wm.wsWriteBufferSize,
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case serverMsg := <-client.serverSentChan:
+				err := client.Conn.WriteMessage(serverMsg.MessageType, serverMsg.Message)
+				if err != nil {
+					client.CancelFunc()
+				}
+			}
 		}
-		wsConn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = fmt.Fprintf(w, "Error creating websocket connection")
-			upgradeChan <- nil
-			return
-		}
-		upgradeChan <- wm.register(wsConn)
 	}()
-	return upgradeChan
+
+	// Listen for client messages and handle unregister
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				wm.Unregister(*client.ConnId)
+				return
+			default:
+				msgType, msg, err := client.Conn.ReadMessage()
+				if err != nil {
+					client.CancelFunc()
+				} else {
+					client.mutex.Lock()
+					if client.IsAlive {
+						for _, observer := range client.observers {
+							go observer(client, msgType, msg)
+						}
+					}
+					client.mutex.Unlock()
+				}
+			}
+		}
+	}()
 }
 
 // AssignGroups assigns a client to one or more groups
@@ -46,7 +84,9 @@ func (wm *Manager) AssignGroups(connId uuid.UUID, groupIds ...uint16) error {
 	if err != nil {
 		return err
 	}
+	wsClient.mutex.Lock()
 	wsClient.Groups = append(wsClient.Groups, groupIds...)
+	wsClient.mutex.Unlock()
 	return nil
 }
 
@@ -56,17 +96,9 @@ func (wm *Manager) RegisterClientObserver(connId uuid.UUID, messageHandler Clien
 		log.Debugf("Websocket RegisterClientObserver error: %s", err)
 		return
 	}
-	go func() {
-		for wsUser.IsAlive {
-			messageType, message, err := wsUser.Conn.ReadMessage()
-			if err != nil {
-				log.Debugf("Websocket RegisterClientObserver error: %s", err)
-				wm.Unregister(connId)
-				return
-			}
-			messageHandler(wsUser, messageType, message)
-		}
-	}()
+	wsUser.mutex.Lock()
+	wsUser.observers = append(wsUser.observers, messageHandler)
+	wsUser.mutex.Unlock()
 }
 
 // BroadcastMessage sends a message to all connected clients
@@ -103,16 +135,19 @@ func (wm *Manager) SendMessageToGroup(group uint16, messageType int, message []b
 
 // SendMessageToClient sends a message to a specific user
 func (wm *Manager) SendMessageToClient(clientId uuid.UUID, messageType int, message []byte) error {
-	wm.mutex.Lock()
-	client, ok := wm.clients[clientId]
-	wm.mutex.Unlock()
-	if !ok {
-		return errors.New("client not found")
-	}
-	if err := client.Conn.WriteMessage(messageType, message); err != nil {
-		wm.Unregister(clientId)
+	client, err := wm.GetWebSocketClient(clientId)
+	if err != nil {
 		return err
 	}
+
+	client.mutex.Lock()
+	if client.IsAlive {
+		client.serverSentChan <- &websocketMessage{
+			Message:     message,
+			MessageType: messageType,
+		}
+	}
+	client.mutex.Unlock()
 	return nil
 }
 
@@ -122,58 +157,57 @@ func (wm *Manager) GetWebSocketClient(clientUUID uuid.UUID) (*Client, error) {
 	defer wm.mutex.Unlock()
 	user, ok := wm.clients[clientUUID]
 	if !ok {
-		return nil, errors.New("client not found")
+		return nil, errors.New("client not found or disconnected")
 	}
 	return user, nil
-}
-
-// register registers a new client to the manager
-// This function is called by the UpgradeClient function
-func (wm *Manager) register(conn *websocket.Conn) *Client {
-	connId := uuid.New()
-	user := &Client{
-		Conn:    conn,
-		ConnId:  &connId,
-		Groups:  make([]uint16, 0),
-		IsAlive: true,
-	}
-	wm.mutex.Lock()
-	wm.clients[connId] = user
-	wm.mutex.Unlock()
-	return user
 }
 
 // Unregister unregisters a client from the manager and marks it as not alive
 // Further messages to and from this client are discarded
 func (wm *Manager) Unregister(connId uuid.UUID) {
-	wm.mutex.Lock()
-	wm.clients[connId].IsAlive = false
-	delete(wm.clients, connId)
-	wm.mutex.Unlock()
+	client, _ := wm.GetWebSocketClient(connId)
+	if client != nil {
+		client.mutex.Lock()
+		wm.mutex.Lock()
+		client.IsAlive = false
+		delete(wm.clients, connId)
+		client.CancelFunc()
+		wm.mutex.Unlock()
+		client.mutex.Unlock()
+	}
 }
 
-// pruneInactiveClients pings all clients and unregisters them if they don't respond
-// This function runs in the background while the websocket manager lives
-func (wm *Manager) pruneInactiveClients() {
-	ticker := time.NewTicker(30 * time.Second) // Ping every 30 seconds
-	for {
-		select {
-		case <-ticker.C:
-			// Broadcast cleans up unreachable clients
-			go wm.BroadcastMessage(websocket.PingMessage, nil)
-		}
+// register registers a new client to the manager
+// This function is called by the UpgradeClient function
+func (wm *Manager) register(conn *websocket.Conn, cancelFunc context.CancelFunc) *Client {
+	connId := uuid.New()
+	client := &Client{
+		Conn:           conn,
+		ConnId:         &connId,
+		Groups:         make([]uint16, 0),
+		IsAlive:        true,
+		CancelFunc:     cancelFunc,
+		serverSentChan: make(chan *websocketMessage),
+		observers:      make([]ClientObservableFunc, 0),
+		mutex:          &sync.Mutex{},
 	}
+	wm.mutex.Lock()
+	wm.clients[connId] = client
+	wm.mutex.Unlock()
+	return client
 }
 
 // multiCastMessage sends a message to multiple clients
 // used by the BroadcastMessage and SendMessageToGroup functions
 func (wm *Manager) multiCastMessage(clients []*Client, messageType int, message []byte) {
+	wm.mutex.Lock()
 	for _, client := range clients {
 		clx := client
-		if client.IsAlive {
+		if client != nil {
 			go func() {
 				_ = wm.SendMessageToClient(*clx.ConnId, messageType, message)
 			}()
 		}
 	}
+	wm.mutex.Unlock()
 }

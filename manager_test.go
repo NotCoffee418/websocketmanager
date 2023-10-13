@@ -1,15 +1,17 @@
 package websocketmanager
 
 import (
+	"context"
 	"fmt"
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
-	"github.com/stretchr/testify/assert"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	"github.com/stretchr/testify/assert"
 )
 
 // TestManagerBuilder tests the builder pattern for constructing Manager
@@ -21,11 +23,12 @@ func TestManagerBuilder(t *testing.T) {
 
 func TestClientRegistrationWithHelper(t *testing.T) {
 	mgr := NewDefaultManager()
-	client, _, _ := helperGetWsClientComms(t, mgr)
+	client, _, _, cancel := helperGetWsClientComms(t, mgr)
 	assert.NotNil(t, client)
 	assert.NotNil(t, client.Conn)
 	assert.NotNil(t, client.ConnId)
 	assert.True(t, client.IsAlive)
+	cancel()
 }
 
 // TestAssignGroups tests assigning groups to a client
@@ -35,6 +38,7 @@ func TestAssignGroups(t *testing.T) {
 	client := &Client{
 		ConnId: &clientId,
 		Groups: []uint16{},
+		mutex:  &sync.Mutex{},
 	}
 
 	mgr.clients[clientId] = client
@@ -48,8 +52,11 @@ func TestAssignGroups(t *testing.T) {
 func TestUnregister(t *testing.T) {
 	mgr := NewDefaultManager()
 	clientId := uuid.New()
+	cancelCalled := false
 	client := &Client{
-		ConnId: &clientId,
+		ConnId:     &clientId,
+		mutex:      &sync.Mutex{},
+		CancelFunc: func() { cancelCalled = true },
 	}
 
 	mgr.clients[clientId] = client
@@ -57,13 +64,14 @@ func TestUnregister(t *testing.T) {
 
 	_, exists := mgr.clients[clientId]
 	assert.False(t, exists)
+	assert.True(t, cancelCalled)
 }
 
 func TestSendMessageToUser(t *testing.T) {
 	mgr := NewDefaultManager()
 
-	client1, cChan1, _ := helperGetWsClientComms(t, mgr)
-	client2, cChan2, _ := helperGetWsClientComms(t, mgr)
+	client1, cChan1, _, cancel1 := helperGetWsClientComms(t, mgr)
+	client2, cChan2, _, cancel2 := helperGetWsClientComms(t, mgr)
 
 	assert.NotNil(t, client1)
 	assert.NotNil(t, client2)
@@ -84,15 +92,17 @@ func TestSendMessageToUser(t *testing.T) {
 	assert.False(t, ok2, "Client 2 should not receive the message")
 
 	assert.Equal(t, "test message", string(receivedMessage1))
+	cancel1()
+	cancel2()
 }
 
 // TestBroadcastMessage tests if the broadcast method is working
 func TestBroadcastMessage(t *testing.T) {
 	mgr := NewDefaultManager()
 
-	client1, cChan1, _ := helperGetWsClientComms(t, mgr)
-	client2, cChan2, _ := helperGetWsClientComms(t, mgr)
-	client3, cChan3, _ := helperGetWsClientComms(t, mgr)
+	client1, cChan1, _, cancel1 := helperGetWsClientComms(t, mgr)
+	client2, cChan2, _, cancel2 := helperGetWsClientComms(t, mgr)
+	client3, cChan3, _, cancel3 := helperGetWsClientComms(t, mgr)
 	mgr.Unregister(*client3.ConnId) // spoof dead
 
 	assert.NotNil(t, client1)
@@ -120,6 +130,9 @@ func TestBroadcastMessage(t *testing.T) {
 	assert.Equal(t, "test message", string(receivedMessage1))
 	assert.Equal(t, "test message", string(receivedMessage2))
 	assert.False(t, ok3, "Client 3 is dead, should not receive the message")
+	cancel1()
+	cancel2()
+	cancel3()
 }
 
 // TestSpamUsers Checks for random panics on nil clients
@@ -138,9 +151,10 @@ func TestSpamUsers(t *testing.T) {
 // TestSendMessageToGroup tests if we can send a message to a specific group
 func TestSendMessageToGroup(t *testing.T) {
 	mgr := NewDefaultManager()
-
+	var cancel context.CancelFunc
 	initGroupedClient := func(groups ...uint16) (*Client, chan []byte) {
-		client, cChan, _ := helperGetWsClientComms(t, mgr)
+		client, cChan, _, xCancel := helperGetWsClientComms(t, mgr)
+		cancel = xCancel
 		assert.NoError(t, mgr.AssignGroups(*client.ConnId, groups...))
 		return client, cChan
 	}
@@ -173,12 +187,11 @@ func TestSendMessageToGroup(t *testing.T) {
 	assert.Equal(t, "test message", string(receivedMessage1))
 	assert.Equal(t, "test message", string(receivedMessage2))
 	assert.False(t, ok3, "Client 3 should not receive the message")
+	cancel()
 }
 
 func TestRegisterClientObserver(t *testing.T) {
 	mgr := NewDefaultManager()
-
-	var client *Client
 
 	// Expects a message from client within a second
 	msgChan := make(chan []byte, 1)
@@ -189,9 +202,11 @@ func TestRegisterClientObserver(t *testing.T) {
 	// Set up spoof server
 	wg := sync.WaitGroup{}
 	wg.Add(1)
+	newCtx, cancel := context.WithCancel(context.Background())
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		clientCh := mgr.UpgradeClientCh(w, r)
-		client = <-clientCh
+		newReq := r.WithContext(newCtx)
+		client, err := mgr.UpgradeClient(w, newReq)
+		assert.NoError(t, err)
 		assert.NotNil(t, client)
 		mgr.RegisterClientObserver(*client.ConnId, clientObservableFunc)
 		wg.Done()
@@ -217,17 +232,24 @@ func TestRegisterClientObserver(t *testing.T) {
 	// Check if we got the message and it's valid
 	assert.True(t, ok)
 	assert.Equal(t, "pong", string(receivedMsg))
+	cancel()
 }
 
 func helperGetWsClientComms(t *testing.T, mgr *Manager) (
-	_client *Client, clientReceived chan []byte, serverReceived chan []byte) {
+	_client *Client,
+	clientReceived chan []byte,
+	serverReceived chan []byte,
+	cancelContext context.CancelFunc) {
 	var client *Client
 
 	wg := sync.WaitGroup{}
 	wg.Add(1)
+	newCtx, cancel := context.WithCancel(context.Background())
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		clientCh := mgr.UpgradeClientCh(w, r)
-		client = <-clientCh
+		newReq := r.WithContext(newCtx)
+		xClient, err := mgr.UpgradeClient(w, newReq)
+		client = xClient
+		assert.NoError(t, err)
 		assert.NotNil(t, client)
 		wg.Done()
 	}))
@@ -264,14 +286,14 @@ func helperGetWsClientComms(t *testing.T, mgr *Manager) (
 		serverReceivedMessagesChan <- message
 	})
 
-	return client, clientReceivedMessagesChan, serverReceivedMessagesChan
+	return client, clientReceivedMessagesChan, serverReceivedMessagesChan, cancel
 }
 
 func helperGetOneFromChannelOrTimeout(t *testing.T, ch <-chan []byte) ([]byte, bool) {
 	select {
 	case res := <-ch:
 		return res, true
-	case <-time.After(3 * time.Second):
+	case <-time.After(1 * time.Second):
 		return nil, false
 	}
 }

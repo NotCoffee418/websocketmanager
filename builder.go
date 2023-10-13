@@ -1,8 +1,9 @@
 package websocketmanager
 
 import (
-	"github.com/google/uuid"
 	"sync"
+
+	"github.com/google/uuid"
 )
 
 // NewDefaultManager Creates a new Manager with default values
@@ -41,7 +42,5 @@ func (b *ManagerBuilder) WithClientCleanupDisabled() *ManagerBuilder {
 }
 
 func (b *ManagerBuilder) Build() *Manager {
-	mgr := &b.wsm
-	mgr.initialize()
-	return mgr
+	return &b.wsm
 }
