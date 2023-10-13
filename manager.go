@@ -28,7 +28,7 @@ func (wm *Manager) UpgradeClient(w http.ResponseWriter, r *http.Request) (*Clien
 		return nil, errors.New("error upgrading websocket connection")
 	}
 
-	ctx, cancel := context.WithCancel(r.Context())
+	ctx, cancel := context.WithCancel(context.Background())
 	client := wm.register(wsConn, cancel)
 	wm.initCommunication(client, ctx)
 	return client, nil
@@ -43,6 +43,7 @@ func (wm *Manager) initCommunication(client *Client, ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
+				close(client.serverSentChan)
 				return
 			case serverMsg := <-client.serverSentChan:
 				err := client.Conn.WriteMessage(serverMsg.MessageType, serverMsg.Message)

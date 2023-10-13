@@ -23,12 +23,11 @@ func TestManagerBuilder(t *testing.T) {
 
 func TestClientRegistrationWithHelper(t *testing.T) {
 	mgr := NewDefaultManager()
-	client, _, _, cancel := helperGetWsClientComms(t, mgr)
+	client, _, _ := helperGetWsClientComms(t, mgr)
 	assert.NotNil(t, client)
 	assert.NotNil(t, client.Conn)
 	assert.NotNil(t, client.ConnId)
 	assert.True(t, client.IsAlive)
-	cancel()
 }
 
 // TestAssignGroups tests assigning groups to a client
@@ -70,8 +69,8 @@ func TestUnregister(t *testing.T) {
 func TestSendMessageToUser(t *testing.T) {
 	mgr := NewDefaultManager()
 
-	client1, cChan1, _, cancel1 := helperGetWsClientComms(t, mgr)
-	client2, cChan2, _, cancel2 := helperGetWsClientComms(t, mgr)
+	client1, cChan1, _ := helperGetWsClientComms(t, mgr)
+	client2, cChan2, _ := helperGetWsClientComms(t, mgr)
 
 	assert.NotNil(t, client1)
 	assert.NotNil(t, client2)
@@ -92,17 +91,15 @@ func TestSendMessageToUser(t *testing.T) {
 	assert.False(t, ok2, "Client 2 should not receive the message")
 
 	assert.Equal(t, "test message", string(receivedMessage1))
-	cancel1()
-	cancel2()
 }
 
 // TestBroadcastMessage tests if the broadcast method is working
 func TestBroadcastMessage(t *testing.T) {
 	mgr := NewDefaultManager()
 
-	client1, cChan1, _, cancel1 := helperGetWsClientComms(t, mgr)
-	client2, cChan2, _, cancel2 := helperGetWsClientComms(t, mgr)
-	client3, cChan3, _, cancel3 := helperGetWsClientComms(t, mgr)
+	client1, cChan1, _ := helperGetWsClientComms(t, mgr)
+	client2, cChan2, _ := helperGetWsClientComms(t, mgr)
+	client3, cChan3, _ := helperGetWsClientComms(t, mgr)
 	mgr.Unregister(*client3.ConnId) // spoof dead
 
 	assert.NotNil(t, client1)
@@ -130,9 +127,6 @@ func TestBroadcastMessage(t *testing.T) {
 	assert.Equal(t, "test message", string(receivedMessage1))
 	assert.Equal(t, "test message", string(receivedMessage2))
 	assert.False(t, ok3, "Client 3 is dead, should not receive the message")
-	cancel1()
-	cancel2()
-	cancel3()
 }
 
 // TestSpamUsers Checks for random panics on nil clients
@@ -151,10 +145,8 @@ func TestSpamUsers(t *testing.T) {
 // TestSendMessageToGroup tests if we can send a message to a specific group
 func TestSendMessageToGroup(t *testing.T) {
 	mgr := NewDefaultManager()
-	var cancel context.CancelFunc
 	initGroupedClient := func(groups ...uint16) (*Client, chan []byte) {
-		client, cChan, _, xCancel := helperGetWsClientComms(t, mgr)
-		cancel = xCancel
+		client, cChan, _ := helperGetWsClientComms(t, mgr)
 		assert.NoError(t, mgr.AssignGroups(*client.ConnId, groups...))
 		return client, cChan
 	}
@@ -187,7 +179,6 @@ func TestSendMessageToGroup(t *testing.T) {
 	assert.Equal(t, "test message", string(receivedMessage1))
 	assert.Equal(t, "test message", string(receivedMessage2))
 	assert.False(t, ok3, "Client 3 should not receive the message")
-	cancel()
 }
 
 func TestRegisterClientObserver(t *testing.T) {
@@ -235,19 +226,39 @@ func TestRegisterClientObserver(t *testing.T) {
 	cancel()
 }
 
+func TestEnsureDeadContext(t *testing.T) {
+	mgr := NewDefaultManager()
+	client, _, _ := helperGetWsClientComms(t, mgr)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	cancelled := false
+	client.CancelFunc = func() {
+		cancelled = true
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		assert.False(t, cancelled)
+		mgr.Unregister(*client.ConnId)
+		time.Sleep(300 * time.Millisecond)
+		assert.True(t, cancelled)
+		wg.Done()
+	}()
+	wg.Wait()
+
+	// Ensure second unregister call doesn't panic
+	assert.NotPanics(t, func() { mgr.Unregister(*client.ConnId) })
+}
+
 func helperGetWsClientComms(t *testing.T, mgr *Manager) (
 	_client *Client,
 	clientReceived chan []byte,
-	serverReceived chan []byte,
-	cancelContext context.CancelFunc) {
+	serverReceived chan []byte) {
 	var client *Client
 
 	wg := sync.WaitGroup{}
 	wg.Add(1)
-	newCtx, cancel := context.WithCancel(context.Background())
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		newReq := r.WithContext(newCtx)
-		xClient, err := mgr.UpgradeClient(w, newReq)
+		xClient, err := mgr.UpgradeClient(w, r)
 		client = xClient
 		assert.NoError(t, err)
 		assert.NotNil(t, client)
@@ -286,7 +297,7 @@ func helperGetWsClientComms(t *testing.T, mgr *Manager) (
 		serverReceivedMessagesChan <- message
 	})
 
-	return client, clientReceivedMessagesChan, serverReceivedMessagesChan, cancel
+	return client, clientReceivedMessagesChan, serverReceivedMessagesChan
 }
 
 func helperGetOneFromChannelOrTimeout(t *testing.T, ch <-chan []byte) ([]byte, bool) {
